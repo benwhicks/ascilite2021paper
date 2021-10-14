@@ -1,0 +1,676 @@
+---
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk[["set"]](
+  echo = FALSE, 
+  message = FALSE, 
+  warning = FALSE,
+  out.width = "60%",
+  out.height = "60%",
+  fig.align = "center",
+  dpi = 200)
+```  
+
+![](banner.png)
+
+``` {r loading}
+library(tidyverse)
+library(lubridate)
+library(knitr)
+library(readxl)
+library(janitor)
+library(retention.data)
+library(retention.helpers)
+```
+
+``` {r reading-cadmus-data}
+subject_names <- read_csv(file.path('~', 'Data', 'Retention', 'Blackboard', 'subject_names.csv')) %>% 
+  mutate(subject = str_extract(offering, "^.{6}"))
+
+# file lists
+sessions_files <- list.files(
+  file.path('~', 'Data', 'Retention', 'Cadmus', 'sessions'),
+  pattern = "^sessions_csu*",
+  full.names = TRUE)
+
+summary_files <- list.files(
+  file.path('~', 'Data', 'Retention', 'Cadmus', 'summary'),
+  pattern = "^summary_csu*",
+  full.names = TRUE)
+
+feedback_files <- list.files(
+  file.path('~', 'Data', 'Retention', 'Cadmus', 'feedback'),
+  pattern = "^feedback_csu*",
+  full.names = TRUE)
+
+resource_files <- list.files(
+  file.path('~', 'Data', 'Retention', 'Cadmus', 'resource'),
+  pattern = "^resource_csu*",
+  full.names = TRUE)
+
+gc_files <- list.files(file.path('~', 'Data', 'Retention', 'Cadmus', 'gradebooks'), full.names = T)
+
+# grade books
+read_gb_csv <- function(path) {
+  # TODO: Handle SY/US grades somehow. Currently they are dropped
+  off <-  str_remove(path, "^.*gc_S-") %>% str_remove("_fullgc_.*$")
+  ts <- lubridate::as_date(str_remove(path, "^.*_fullgc_") %>% str_extract("[0-9]{4}-[0-9]{2}-[0-9]{2}"))
+  read_csv(path) %>% 
+    janitor::remove_empty("cols") %>% 
+    select(
+      id = `Student ID`, firstname = `First Name`, lastname = `Last Name`, user_id = Username,
+      (contains("Score]") & where(is.numeric))) %>% 
+    mutate(id = as.character(id)) %>%  # making sure
+    pivot_longer(cols = contains("Score]"), names_to = "assessment_string", values_to = "raw_mark") %>% 
+    mutate(
+      offering = off, date_updated = ts,
+      assessment_name = str_extract(assessment_string, "^.* \\[" ) %>% str_remove(" \\["),
+      possible = as.numeric(str_extract(assessment_string, " [0-9]* Score") %>% str_remove(" Score")),
+      gradebook_id = as.numeric(str_extract(assessment_string, "[0-9]*$"))
+    ) %>% 
+    select(-assessment_string) %>% 
+    mutate(
+      mark = raw_mark / possible,
+      subject = str_extract(offering, ".{6}")) %>% 
+    select(subject, offering, assessment_name, id, mark, everything())
+}
+
+gradebooks_df <- map_df(gc_files, read_gb_csv)
+
+# Will move these to retention.helpers at some point
+read_cadmus_summary <- function(path) {
+  ass_id <- path %>% 
+    stringr::str_remove("^.*summary_csu_") %>% 
+    stringr::str_remove("_.*$")
+  
+  read_csv(path, col_types = "cccnnnnnnnccccnccccn") %>% 
+    dplyr::mutate(
+      user_id = str_extract(email, "^.*@") %>% str_remove("@"),
+      assessment_id = ass_id) %>% 
+    dplyr::mutate(
+      grade = if_else(grade == "Ungraded", NA_real_, 
+                      as.numeric(str_remove(grade, "%"))),
+      similarity_score = if_else(similarity_score == "No similarity", NA_real_, 
+                                 as.numeric(str_remove(similarity_score, "%"))),
+      first_save_at = str_remove(first_save_at, "^.{4}") %>% str_extract("^.{20}") %>% mdy_hms(),
+      final_save_at = str_remove(final_save_at, "^.{4}") %>% str_extract("^.{20}") %>% mdy_hms()) %>% 
+    dplyr::select(assessment_id, work_id, user_id, everything())
+}
+
+cadmus_summary_df <- map_df(summary_files, read_cadmus_summary)
+
+read_cadmus_session <- function(path) {
+  ass_id <- path %>% 
+    stringr::str_remove("^.*sessions_csu_") %>% 
+    stringr::str_remove("_.*$")
+  
+  read_csv(path) %>% 
+    dplyr::mutate(
+      assessment_id = ass_id,
+      user_id = str_extract(email, "^.*@") %>% str_remove("@")) %>% 
+    dplyr::select(assessment_id, work_id, user_id, everything())
+}
+
+cadmus_session_df <- map_df(sessions_files, read_cadmus_session)
+
+
+read_cadmus_resource <- function(path) {
+  ass_id <- path %>% 
+    stringr::str_remove("^.*resource_csu_") %>% 
+    stringr::str_remove("_.*$")
+  
+  if (ncol(read_csv(path)) > 2) {
+  read_csv(path) %>% 
+    pivot_longer(starts_with("resource_"), names_to = "resource", values_to = "resource_accesses") %>% 
+    mutate(resource = str_remove(resource, "^resource_")) %>% 
+    mutate(assessment_id = ass_id) %>% 
+    select(assessment_id, work_id, name, everything())
+  } else {
+  read_csv(path) %>% 
+      mutate(assessment_id = ass_id, resource = NA_character_, resource_accesses = NA_real_) %>% 
+      slice(0) %>% # return empty - no resources 
+      select(assessment_id, work_id, name, everything())
+  }
+}
+
+cadmus_resource_df <- map_df(resource_files, read_cadmus_resource) %>% 
+  left_join(cadmus_session_df %>% distinct(work_id, user_id)) %>% 
+  select(assessment_id, work_id, user_id, everything())
+
+read_cadmus_feedback <- function(path) {
+  ass_id <- path %>% 
+    stringr::str_remove("^.*feedback_csu_") %>% 
+    stringr::str_remove("_.*$")
+  
+  read_csv(path) %>% 
+    dplyr::mutate(last_feedback_access = suppressWarnings(lubridate::ymd_hms(last_feedback_access))) %>% 
+    dplyr::mutate(
+      user_id = email %>% 
+        stringr::str_extract("^.*@") %>% 
+        stringr::str_remove("@")) %>% 
+    dplyr::mutate(assessment_id = ass_id) %>% 
+    dplyr::select(assessment_id, work_id, user_id, everything())
+}
+
+cadmus_feedback_df <- map_df(feedback_files, read_cadmus_feedback)
+
+fetch_session_end <- function(s) {
+  sessions %>% 
+    filter(session == s) %>% 
+    pull(end_date)
+}
+
+cadmus_subjects_assessments <- read_excel(
+  file.path("~", "Data", "Retention", "Cadmus", "CSU Assessment Overview & Student Submission Data.xlsx"),
+  sheet = "Subject ID & Assessments",
+  skip = 3
+) %>% 
+  mutate(due_date = lubridate::as_datetime(due_date)) %>% 
+  mutate(
+    session = case_when( # estimating based on due date
+      due_date < fetch_session_end(202030) ~ 202030,
+      due_date < fetch_session_end(202060) ~ 202060,
+      due_date < fetch_session_end(202090) ~ 202090,
+      due_date < fetch_session_end(202130) ~ 202130,
+      due_date < fetch_session_end(202160) ~ 202160
+    )
+  ) %>% 
+  left_join(
+    subject_names %>% 
+      distinct(session, subject, subject_name))
+
+cadmus_subjects_assessments %>% 
+  filter(!is.na(subject)) %>% 
+  filter(!str_detect(tolower(assessment_name), "exam")) %>% 
+  filter(!is.na(due_date))
+
+
+```
+
+Looking at assessments in IKC101, which had reasonably clean matching data. 
+
+``` {r filtering-on-subject}
+# Look at IKC101. Data seems reasonably clean
+SUBJECT <- "IKC101" # making this code a little re-usable
+
+dat_assessments <- cadmus_subjects_assessments %>%
+  select(!starts_with("n_")) %>% 
+  filter(subject == SUBJECT) %>% 
+  inner_join(subject_names) %>% 
+  inner_join(gradebooks_df) %>% 
+  left_join(academic)
+
+dat_summaries <- dat_assessments %>% 
+  inner_join(cadmus_summary_df %>% select(-grade))
+```
+
+As we are looking at assessments with a due date, all timestamp fields can be made *relative* to the due date. Subject that utilised ASSIST may have a soft 2 week due date, which muddies the waters somewhat.
+
+``` {r adding-relative-timestamps}
+cadmus_summary_df_rel <- dat_summaries %>% 
+  mutate(
+    first_save_at = as.numeric(first_save_at - due_date,  unit = "days"), 
+    final_save_at = as.numeric(final_save_at - due_date,  unit = "days") 
+  ) %>% 
+  mutate(assessment_name = str_remove(assessment_name, "Media ") %>% 
+           str_replace("Expression of Interest", "Structured Writing") %>% 
+           fct_relevel("Reflection", "Critique", "Essay", "Structured Writing")) %>%
+  mutate(offline_work = percentage_pasted - similarity_score / 100) %>% 
+  mutate(usage = if_else(offline_work < 0.5, "in tool", "offline"))
+ 
+cadmus_session_df_rel <- cadmus_session_df %>% 
+  select(-email) %>% 
+  inner_join(
+    cadmus_summary_df_rel %>% 
+      distinct(assessment_id, subject_name, subject_id, 
+               assessment_name, grade, mark, work_id, 
+               user_id, due_date, offline_work, usage)) %>% 
+  mutate(old_start = start, old_end = end) %>% 
+  mutate(
+    start = as.numeric(start - due_date,  unit = "days"), 
+    end = as.numeric(end - due_date,  unit = "days") 
+  )
+
+```
+
+``` {r munging-retention-data}
+act <- activity %>% 
+  inner_join(dat_summaries %>% select(offering)) %>% 
+  inner_join(student_ids %>% select(id, user_id)) %>% 
+  distinct()
+
+act_prior_due_dates <- act %>% 
+  inner_join(
+    cadmus_summary_df_rel %>% 
+      distinct(assessment_name, due_date, user_id, usage) %>% 
+      mutate(due_date = as_date(due_date))
+  ) %>% 
+  group_by(user_id, assessment_name, usage) %>% 
+  summarise( # Key here is activity in the week prior to 1 week to go in the assessment
+    clicks_prior_raw = sum(clicks * between(due_date - date, 7, 14), na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  group_by(assessment_name) %>% 
+  mutate(clicks_prior = as.numeric(scale(clicks_prior_raw))) %>% 
+  ungroup()
+
+stu <- cadmus_summary_df %>% 
+    distinct(user_id) %>% 
+    inner_join(student_ids) %>% 
+    select(-email) %>% 
+    inner_join(
+      student_demographics %>% 
+        select(id, domesticity, atsi, nesb, parental_education, ses, remoteness)) %>%
+    # mutate(session = 202060) %>% 
+    inner_join(
+      student_progress %>% 
+        select(id, course, course_faculty, course_level, basis_of_admission, commencing, 
+               gpa)
+    )
+
+n_students_submitting_work <- nrow(distinct(cadmus_summary_df_rel, id))
+n_assessments_submitted <- nrow(distinct(cadmus_summary_df_rel, assessment_id, id))
+n_sessions <- nrow(cadmus_session_df_rel)
+
+```
+
+## Overall usage
+
+`r n_students_submitting_work` students submitted some assessment, for a total of `r n_assessments_submitted` distinct pieces of work. This was completed over `r n_sessions` separate log in sessions.
+
+## Did students use the tool as intended?
+
+This consists of three key components:
+
+* In the tool editing. This can be estimated by looking at the % of words pasted into the online editing environment.
+* Accessing of the resources
+* Accessing of the feedback
+
+### Editing within the tool environment
+
+``` {r}
+INTOOL_PP_THRESH <- 0.35
+
+cadmus_summary_df_rel %>% 
+  ggplot(aes(x = percentage_pasted, fill = percentage_pasted <= INTOOL_PP_THRESH)) + 
+  geom_histogram(binwidth = 0.05) + 
+  scale_fill_manual(
+    guide = "none",
+    values = csu_colours
+  ) +
+  scale_y_continuous(labels = NULL, name = "Count") +
+  scale_x_continuous(labels = scales::percent_format(), name = "Percentage of work pasted into tool") +
+  facet_wrap(~ assessment_name) +
+  theme_minimal() +
+  ggtitle("Use of assessment tool", 
+          subtitle = paste0("Students pasting over ", INTOOL_PP_THRESH * 100, "% highlighted"))
+
+INTOOL_OW_THRESH <- 0.5
+
+cadmus_summary_df_rel %>% 
+  ggplot(aes(x = offline_work, fill = offline_work <= INTOOL_OW_THRESH)) + 
+  geom_histogram(binwidth = 0.05, center = 0) + 
+  scale_fill_manual(
+    guide = "none",
+    values = csu_colours
+  ) +
+  scale_y_continuous(labels = NULL, name = "Count") +
+  scale_x_continuous(
+    name = "Offline work metric : Percentage pasted - Similarity score") +
+  facet_wrap(~ assessment_name) +
+  theme_minimal() +
+  ggtitle("Use of assessment tool by Offline Work metric", 
+          subtitle = paste0("Students over ", INTOOL_OW_THRESH, " highlighted"))
+```
+
+### Accessing the resources
+
+``` {r accessing-resources}
+dat_resources <- cadmus_summary_df_rel %>% 
+  distinct(assessment_name, assessment_id, work_id, user_id, mark, usage) %>% 
+  inner_join(
+    cadmus_resource_df %>% 
+      group_by(assessment_id, work_id, user_id) %>% 
+      summarise(
+        n_resources_accessed = sum(resource_accesses > 0),
+        total_resource_accesses = sum(resource_accesses)
+      )
+  ) %>% 
+  group_by(assessment_name) %>% 
+  mutate(
+    relative_mark = as.numeric(scale(mark)),
+    accessed_resources = if_else(n_resources_accessed > 0, "Viewed some resources", "Did not access any resources")) %>% 
+  ungroup() 
+
+dat_resources %>% 
+  filter(!is.na(usage), !is.na(mark)) %>%
+  mutate(
+    result = if_else(mark < 0.5, "fail", "pass"),
+    assessment_grade = case_when(
+      mark < 0.5 ~ "FL",
+      mark < 0.65 ~ "PS",
+      mark < 0.75 ~ "CR",
+      mark < 0.85 ~ "DI",
+      mark >= 0.85 ~ "HD"
+    ) %>% 
+      fct_relevel(rev(c("FL", "PS", "CR", "DI", "HD")))) %>% 
+  ggplot() +
+  geom_histogram(aes(n_resources_accessed, fill = assessment_grade), 
+                 binwidth = 1, color = "black", position = "fill") +
+  viridis::scale_fill_viridis(
+    discrete = TRUE, 
+    option = "B", 
+    name = "Assessment grade", 
+    direction = -1) +
+  # scale_fill_manual(values = csu_colours, name = "Assessment result") +
+  facet_grid(. ~ assessment_name, scales = "free_y") +
+  scale_y_continuous(name = "Proportion", labels = scales::percent_format()) +
+  xlab("Distinct resources accessed") +
+  theme_minimal()
+```
+
+### Accessing feedback
+
+``` {r}
+dat_feedback <- cadmus_summary_df_rel %>% 
+  distinct(assessment_name, assessment_id, work_id, user_id, mark, usage) %>% 
+  inner_join(cadmus_feedback_df %>% select(-name, -email)) %>% 
+  group_by(user_id) %>% 
+  arrange(user_id, assessment_name) %>% 
+  mutate(
+    feedback_previous_access = lag(n_feedback_access, default = 0, order_by = assessment_name),
+    feedback_cumulative_accesses = cumsum(n_feedback_access) - n_feedback_access
+  ) %>% 
+  group_by(assessment_name) %>% 
+  mutate(
+    relative_mark = scale(mark) %>% as.numeric(),
+    viewed_previous_feedback = if_else(
+      feedback_previous_access > 0, 
+      "Accessed recent feedback", 
+      "Ignored recent feedback")) %>% 
+  mutate(
+    mark_scaled_2sd = relative_mark / 2
+  ) %>% 
+  ungroup()
+
+dat_comp <- dat_feedback %>% 
+  select(assessment_name, user_id, work_id, relative_mark, 
+         mark_scaled_2sd, viewed_previous_feedback) %>% 
+  inner_join(
+    dat_resources %>% 
+      select(assessment_name, user_id, work_id, accessed_resources)
+  ) %>% 
+  mutate(
+    viewed_previous_feedback = if_else(
+      viewed_previous_feedback == "Accessed recent feedback",
+      "Yes", "No") %>% 
+      fct_relevel("No", "Yes"),
+    accessed_resources = if_else(
+      accessed_resources == "Viewed some resources",
+      "Yes", "No") %>% 
+      fct_relevel("No", "Yes")
+  ) %>% 
+  inner_join(
+    cadmus_summary_df_rel %>% 
+      mutate(
+        start_early = if_else(
+          first_save_at < -7,
+          "Yes",
+          "No") %>% 
+          fct_relevel("No", "Yes")) %>% 
+      select(assessment_name, user_id, work_id, start_early)
+    ) %>% 
+  inner_join(
+    act_prior_due_dates
+  )
+
+# function for the labels below
+give.n <- function(x) {
+  return(c(y = median(x) - 0.3, label = length(x)))
+}
+
+
+figure_1 <- dat_feedback %>%
+  inner_join(
+    dat_resources %>% 
+      select(user_id, work_id, assessment_id, n_resources_accessed, accessed_resources)) %>% 
+  filter(assessment_name != "Reflection") %>% # ignore first assessment (can't look at previous feedback!)
+  mutate(hue = case_when(
+    accessed_resources == "Viewed some resources" & viewed_previous_feedback == "Accessed recent feedback" ~ 2,
+    accessed_resources != "Viewed some resources" & viewed_previous_feedback != "Accessed recent feedback" ~ 0,
+    TRUE ~ 1,
+  )) %>% 
+  ggplot(aes(x = 1, y = relative_mark, 
+                   fill = hue, alpha = hue)) +
+  geom_boxplot(varwidth = T) +
+  # scale_fill_manual(values = csu_colours_light, guide = "none") +
+  scale_fill_gradient(low = csu_colours[6], high = csu_colours[3], guide = "none") +
+  scale_y_continuous(name = "Assessment z-score") +
+  geom_hline(yintercept = 0, alpha = 0.5, linetype = 2) +
+  facet_grid(viewed_previous_feedback ~ accessed_resources) +
+  scale_x_discrete(name = "") +
+  scale_alpha_continuous(range = c(0.7, 1), guide = "none") +
+  stat_summary(fun.data = give.n, geom = "text") +
+  theme_minimal() 
+
+figure_1 +
+  theme(panel.border = element_rect(color = "black", fill = NA, size = 1)) +
+  ggtitle("Assessment mark distribution based on resource and feedback use",
+          subtitle = "Counts of relevant assessment attempts for each group inside boxplot") 
+
+  
+# ggsave('ascilite2021-cadums-figure-1.png', plot = figure_1 +
+#   theme(
+#     text = element_text(size = 16),
+#     panel.border = element_rect(color = "black", fill = NA, size = 1)), dpi = 400)
+```
+
+``` {r}
+dat_feedback_resource_counts <- dat_comp %>% 
+  group_by(user_id) %>% 
+  summarise(
+    any_resource = any(accessed_resources == "Yes") %>% if_else("Viewed some resources", "Ignored all resource"), 
+    any_feedback = any(viewed_previous_feedback == "Yes") %>% 
+      if_else("Viewed some feedback", "Ignored all feedback"),
+    all_resource = all(accessed_resources == "Yes") %>% if_else("Viewed all resources", "Ignored some resources"), 
+    all_feedback = all(viewed_previous_feedback == "Yes") %>% 
+      if_else("Viewed all feedback", "Ignored some feedback")) 
+
+# Any
+dat_feedback_resource_counts %>% 
+  tabyl(any_resource, any_feedback) %>% 
+  adorn_percentages("all") %>% 
+  adorn_pct_formatting() %>% 
+  adorn_ns() %>% 
+  knitr::kable(caption = "Accessing some resources and feedback")
+
+# All
+dat_feedback_resource_counts %>% 
+  tabyl(all_resource, all_feedback) %>% 
+  adorn_percentages("all") %>% 
+  adorn_pct_formatting() %>% 
+  adorn_ns() %>% 
+  knitr::kable(caption = "Accessing all resources and feedback")
+```
+
+## How might the tool be used to predict assessment risk?
+
+``` {r}
+
+# assessments for IKC101; Reflection (), 
+
+csd <- cadmus_session_df_rel %>% 
+  mutate(
+    body_words_added = bodyWordsTyped + bodyWordsPasted - bodyWordsDeleted,
+    reference_words_added = referencesWordsTyped + referencesWordsPasted - referencesWordsDeleted,
+    body_activity = bodyWordsTyped + bodyWordsPasted + bodyWordsDeleted,
+    reference_activity = referencesWordsTyped + referencesWordsPasted + referencesWordsDeleted) %>% 
+  group_by(work_id, user_id, mark, offline_work, usage) %>%
+  arrange(start) %>% 
+  mutate(
+    next_start = coalesce(lead(start), end),
+    body_completed = cumsum(body_words_added),
+    reference_completed = cumsum(reference_words_added),
+    total_activity = cumsum(body_activity + reference_activity)
+  ) %>% 
+  mutate(total_completed = body_completed + reference_completed) %>%
+  ungroup() %>% 
+  filter(body_completed >= 0, body_words_added + reference_words_added >= 0) %>% 
+  arrange(user_id, work_id) 
+
+
+UPPER_LOWER_LIM <- 0.1
+
+csd_groups <- cadmus_summary_df_rel %>%
+  # filter(usage == "in tool") %>% # CAREFUL!!! This is removing heavier pasters
+  mutate(
+    first_save_at = if_else(assessment_name == "Reflection", first_save_at, first_save_at - 0),
+    final_save_at = if_else(assessment_name == "Reflection", final_save_at, final_save_at - 0)
+    ) %>% 
+  group_by(assessment_name) %>% 
+  mutate(
+    mean_time_spent_assessment = mean(time_spent_days, na.rm = T),
+    group = case_when(
+      mark < 0.5 ~ "FL",
+      mark < 0.65 ~ "PS",
+      mark < 0.75 ~ "CR",
+      mark < 0.85 ~ "DI",
+      mark >= 0.85 ~ "HD"
+    ) %>% 
+      fct_relevel(c("FL", "PS", "CR", "DI", "HD"))) %>% 
+  filter(!is.na(group)) %>% 
+  group_by(group, assessment_name) %>% 
+  summarise(
+    mark = mean(mark, na.rm = T),
+    n_students = n_distinct(id),
+    first_save_mean = mean(first_save_at, na.rm = T),
+    first_save_lower = quantile(first_save_at, UPPER_LOWER_LIM, na.rm = T),
+    first_save_lower_2 = quantile(first_save_at, UPPER_LOWER_LIM * 2, na.rm = T),
+    first_save_lower_3 = quantile(first_save_at, UPPER_LOWER_LIM * 3, na.rm = T),
+    first_save_upper = quantile(first_save_at, 1 - UPPER_LOWER_LIM, na.rm = T),
+    final_save_mean = mean(final_save_at, na.rm = T),
+    final_save_lower = quantile(final_save_at, UPPER_LOWER_LIM, na.rm = T),
+    final_save_upper = quantile(final_save_at, 1 - UPPER_LOWER_LIM, na.rm = T),
+    final_save_upper_2 = quantile(final_save_at, 1 - 2 * UPPER_LOWER_LIM, na.rm = T),
+    final_save_upper_3 = quantile(final_save_at, 1 - 3 * UPPER_LOWER_LIM, na.rm = T),
+    time_spent = sum(time_spent_days / mean_time_spent_assessment, na.rm = T) / n_distinct(id),
+    words_added = sum(total_words_added, na.rm = T) / n_distinct(id),
+    words_pasted = sum(total_words_pasted, na.rm = T) / n_distinct(id),
+    similarity_score = mean(similarity_score / 100, na.rm = T),
+    n_pastes = mean(n_pastes, na.rm = T),
+    percentage_pasted = mean(percentage_pasted, na.rm = T)
+  )
+
+
+csd_groups %>% 
+  ggplot(aes(color = time_spent
+             # / (similarity_score + percentage_pasted)
+             , y = mark, yend = mark)) +
+  geom_segment(aes(x = first_save_lower, xend = final_save_upper),
+    alpha = 0.2,
+    size = 1
+  ) +
+  geom_segment(aes(x = first_save_lower_2, xend = final_save_upper_2),
+    alpha = 0.4,
+    size = 2
+  ) +
+  geom_segment(aes(x = first_save_lower_3, xend = final_save_upper_3),
+    alpha = 0.6,
+    size = 3
+  ) +
+  geom_segment(aes(x = first_save_mean, xend = final_save_mean),
+    size = 5,
+    alpha = 0.8
+  ) +
+  theme_minimal() +
+  scale_x_continuous(name = "Days after initial due date") +
+  # scale_color_manual(values = csu_colours) +
+  # viridis::scale_colour_viridis(name = "Time spent (days)") +
+  scale_color_gradient2(
+    low = csu_colours[8],
+    mid = csu_colours[2],
+    midpoint = 1,
+    breaks = c(0.5, 1, 1.5),
+    high = csu_colours[1],
+    name = "Relative time spent"
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(2),
+    name = "Mean group mark"
+  ) +
+  geom_vline(xintercept = 0, alpha = 0.3) +
+  facet_wrap(~ assessment_name) +
+  ggtitle("Average start and finished times based on assessment grade",
+          subtitle = "Large box is average start to average finish; smaller boxes are 70%, 80% and 90% quantiles")
+```
+
+
+### Modelling relative mark against feedback, early start, resources and LMS activity
+
+Here we model assessment mark against potential early indicators for performance. The four possible indicators are:
+
+* LMS activity. Total clicks in the 7 to 14 days prior to the assessment window, scaled according to overall activity on the subject site in that period. Effectively this imagining the teacher checking 1 week prior to the due date how active the students have been in the previous week.
+* Starting early. Yes / No if the student began work on their assessment 7 or more days earlier than the due date. 
+* Accessing resources. Yes / No if the student accessed any of the designated resources for the assessment.
+* Viewing feedback. Yes / No if the student viewed the feedback for the _previous_ assessment.
+
+
+Modelling focuses on users working on the assignment 'in tool' - without a high percentage of pasting. 
+
+``` {r }
+library(brms)
+library(bayesplot)
+# only on 'in tool' users
+intool.data <- dat_comp %>% 
+  filter(complete.cases(.), usage == "in tool") 
+
+all.data <- dat_comp %>% 
+  filter(complete.cases(.)) 
+
+clicks_sd <- sd(intool.data %>% pull(clicks_prior_raw), na.rm = T)
+
+mod_form <- formula(relative_mark ~ viewed_previous_feedback + accessed_resources + start_early + clicks_prior_2sd)
+
+intool.data <- intool.data %>% 
+  mutate(clicks_prior = clicks_prior_raw / clicks_sd) %>% 
+  mutate(clicks_prior_2sd = clicks_prior_raw / (2 * clicks_sd))
+
+mod.pp <- brm(
+  relative_mark ~ viewed_previous_feedback + accessed_resources + start_early + clicks_prior_2sd,
+  prior = prior(normal(0, 1)),
+  sample_prior = "only",
+  data = intool.data)
+
+pp.intervals.data <- mcmc_intervals_data(mod.brms.intool.pp)
+
+mod <- brm(
+  relative_mark ~ viewed_previous_feedback + accessed_resources + start_early + clicks_prior_2sd,
+  prior = set_prior("normal(0, 1)"),
+  data = intool.data)
+
+mcmc_intervals(mod.pp)
+
+
+figure_2 <- mcmc_intervals(
+  mod, 
+  regex_pars = "^b_[vasc]", 
+  prob = 0.5, prob_outer = 0.9) + 
+  scale_y_discrete(labels = c(
+    "Viewing feedback", "Accessing resources", "Starting early", "LMS activity"
+  )) + 
+  xlab("Relative effect on assessment mark (change in standardised score)") + 
+  theme(text = element_text(size = 16)) +
+  ggtitle("Comparative early indicators for assessment performance", 
+          subtitle = "Showing point estimate with 50% and 90% compatability intervals")
+  
+figure_2
+
+
+ggsave('ascilite2021-cadmus-figure-2.png', 
+       plot = figure_2, 
+       dpi = 400)
+
+```
+
